@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     # First Party
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
+from vllm.distributed.parallel_state import get_world_group
+
 logger = init_logger(__name__)
 
 

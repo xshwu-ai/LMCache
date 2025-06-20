@@ -688,75 +688,78 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
-        if self.kv_role == "kv_consumer":
-            # Don't do save if the role is kv_consumer
-            return
+        try:
+            if self.kv_role == "kv_consumer":
+                # Don't do save if the role is kv_consumer
+                return
 
-        if self.use_layerwise:
-            for layerwise_storer in self.layerwise_storers:
-                next(layerwise_storer)
-            return
+            if self.use_layerwise:
+                for layerwise_storer in self.layerwise_storers:
+                    next(layerwise_storer)
+                return
 
-        connector_metadata = self._parent._get_connector_metadata()
-        assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+            connector_metadata = self._parent._get_connector_metadata()
+            assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
-        assert len(self.kv_caches) > 0
-        kvcaches = list(self.kv_caches.values())
+            assert len(self.kv_caches) > 0
+            kvcaches = list(self.kv_caches.values())
 
-        assert self.lmcache_engine is not None
+            assert self.lmcache_engine is not None
 
-        for request in connector_metadata.requests:
-            save_spec = request.save_spec
-            if save_spec is None or not save_spec.can_save:
-                continue
+            for request in connector_metadata.requests:
+                save_spec = request.save_spec
+                if save_spec is None or not save_spec.can_save:
+                    continue
 
-            token_ids = request.token_ids
-            assert isinstance(token_ids, torch.Tensor)
-            assert token_ids.is_cpu
+                token_ids = request.token_ids
+                assert isinstance(token_ids, torch.Tensor)
+                assert token_ids.is_cpu
 
-            slot_mapping = request.slot_mapping
-            assert isinstance(slot_mapping, torch.Tensor)
-            assert len(slot_mapping) == len(token_ids)
+                slot_mapping = request.slot_mapping
+                assert isinstance(slot_mapping, torch.Tensor)
+                assert len(slot_mapping) == len(token_ids)
 
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.cuda()
-            # NOTE: In PD setting, lmcache_engine.lookup() will always return
-            # 0 if there is no local storage configured. In this case, we
-            # should rely on the slip_leading_tokens in save_spec to avoid
-            # transmit the already saved tokens again.
-            # skip_leading_tokens = max(
-            #    self.lmcache_engine.lookup(token_ids),
-            #    save_spec.skip_leading_tokens,
-            # )
-            skip_leading_tokens = save_spec.skip_leading_tokens
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = slot_mapping.cuda()
+                # NOTE: In PD setting, lmcache_engine.lookup() will always return
+                # 0 if there is no local storage configured. In this case, we
+                # should rely on the slip_leading_tokens in save_spec to avoid
+                # transmit the already saved tokens again.
+                # skip_leading_tokens = max(
+                #    self.lmcache_engine.lookup(token_ids),
+                #    save_spec.skip_leading_tokens,
+                # )
+                skip_leading_tokens = save_spec.skip_leading_tokens
 
-            if skip_leading_tokens == len(token_ids):
-                continue  # skip this request
-            # Align to lmcache chunk size
-            skip_leading_tokens = (
-                skip_leading_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
+                if skip_leading_tokens == len(token_ids):
+                    continue  # skip this request
+                # Align to lmcache chunk size
+                skip_leading_tokens = (
+                    skip_leading_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
 
-            store_mask = torch.ones_like(token_ids, dtype=torch.bool)
-            store_mask[:skip_leading_tokens] = False
+                store_mask = torch.ones_like(token_ids, dtype=torch.bool)
+                store_mask[:skip_leading_tokens] = False
 
-            logger.info(
-                "Storing KV cache for %d out of %d tokens "
-                "(skip_leading_tokens=%d) for request %s",
-                len(token_ids) - skip_leading_tokens,
-                len(token_ids),
-                skip_leading_tokens,
-                request.req_id,
-            )
-            self.lmcache_engine.store(
-                token_ids,
-                mask=store_mask,
-                kvcaches=kvcaches,
-                slot_mapping=slot_mapping,
-                offset=skip_leading_tokens,
-            )
+                logger.info(
+                    "Storing KV cache for %d out of %d tokens "
+                    "(skip_leading_tokens=%d) for request %s",
+                    len(token_ids) - skip_leading_tokens,
+                    len(token_ids),
+                    skip_leading_tokens,
+                    request.req_id,
+                )
+                self.lmcache_engine.store(
+                    token_ids,
+                    mask=store_mask,
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping,
+                    offset=skip_leading_tokens,
+                )
+        except Exception as e:
+            logger.error(f"wait_for_save error: {e}")
 
     def get_finished(
         self, finished_req_ids: set[str]

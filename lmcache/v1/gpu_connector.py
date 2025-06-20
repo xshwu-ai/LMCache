@@ -316,6 +316,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         - chunk_size: The MAX size of the chunk to be copied to GPU.
         - dtype: The data type of the intermediate buffer.
         """
+        num_layers += 1
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
         self.kv_cache_pointers = torch.empty(
@@ -342,7 +343,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             )
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
+        #logger.info(f"_initialize_pointers, {kv_caches=}")
         self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
+        logger.info(f"_initialize_pointers, kv_cache_pointers")
         device = kv_caches[0].device
         assert device.type == "cuda", "The device should be CUDA."
         idx = device.index
@@ -350,7 +353,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             self.kv_cache_pointers_on_gpu[idx] = torch.empty(
                 self.num_layers, dtype=torch.int64, device=device
             )
+        logger.info(f"_initialize_pointers, before kv_cache_pointers_on_gpu.copy_")
         self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
+        logger.info(f"_initialize_pointers, after kv_cache_pointers_on_gpu.copy_")
         if self.use_mla:
             # kv_caches[0].shape: [num_pages, page_size, head_size]
             assert kv_caches[0].dim() == 3
@@ -435,52 +440,59 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
-        assert memory_obj.tensor is not None
+        try:
+            assert memory_obj.tensor is not None
 
-        if "kvcaches" not in kwargs:
-            raise ValueError("'kvcaches' should be provided in kwargs.")
+            if "kvcaches" not in kwargs:
+                raise ValueError("'kvcaches' should be provided in kwargs.")
 
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
+            if "slot_mapping" not in kwargs:
+                raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+            logger.info(f"from_gpu, {start=}, {end=}")
 
-        kv_cache_pointers = self._initialize_pointers(kvcaches)
+            kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+            slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
-            lmc_ops.multi_layer_kv_transfer(
-                memory_obj.tensor,
-                kv_cache_pointers,
-                slot_mapping[start:end],
-                kvcaches[0].device,
-                self.page_buffer_size,
-                True,
-                self.use_mla,
-            )
-        else:
-            # kvcaches -> gpu_buffer -> memobj
-            assert self.gpu_buffer.device == kvcaches[0].device
-            tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
-            lmc_ops.multi_layer_kv_transfer(
-                tmp_gpu_buffer,
-                kv_cache_pointers,
-                slot_mapping[start:end],
-                kvcaches[0].device,
-                self.page_buffer_size,
-                True,
-                self.use_mla,
-            )
-            memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+            kv_cache_pointers = self._initialize_pointers(kvcaches)
 
-        if not memory_obj.tensor.is_cuda:
-            # Force a synchronize if the target buffer is NOT CUDA device
-            # NOTE: for better performance, we may not want to sync for every
-            # memory object
-            torch.cuda.synchronize()
+            if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+                logger.info(f"from_gpu, {start=}, {end=} gpu_buffer is None")
+                lmc_ops.multi_layer_kv_transfer(
+                    memory_obj.tensor,
+                    kv_cache_pointers,
+                    slot_mapping[start:end],
+                    kvcaches[0].device,
+                    self.page_buffer_size,
+                    True,
+                    self.use_mla,
+                )
+            else:
+                # kvcaches -> gpu_buffer -> memobj
+                logger.info(f"from_gpu, {start=}, {end=} gpu_buffer is not None")
+                assert self.gpu_buffer.device == kvcaches[0].device
+                tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+                lmc_ops.multi_layer_kv_transfer(
+                    tmp_gpu_buffer,
+                    kv_cache_pointers,
+                    slot_mapping[start:end],
+                    kvcaches[0].device,
+                    self.page_buffer_size,
+                    True,
+                    self.use_mla,
+                )
+                memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
-        if self.use_mla:
-            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+            if not memory_obj.tensor.is_cuda:
+                # Force a synchronize if the target buffer is NOT CUDA device
+                # NOTE: for better performance, we may not want to sync for every
+                # memory object
+                torch.cuda.synchronize()
+
+            if self.use_mla:
+                memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        except Exception as e:
+            logger.error(f"from_gpu error: {e}")
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
