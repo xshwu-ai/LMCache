@@ -170,6 +170,7 @@ class ReqMeta:
 
     @staticmethod
     def from_request_tracker(
+        lmcache_connector: "LMCacheConnectorV1Impl",
         tracker: RequestTracker,
         block_size: int,
         lmcache_chunk_size: int = 256,
@@ -180,6 +181,7 @@ class ReqMeta:
         """Create the request metadata from a request tracker.
 
         Args:
+            lmcache_connector (LMCacheConnectorV1Impl): the LMCache connector instance.
             tracker (RequestTracker): the request tracker.
             block_size (int): the block size in vLLM.
             lmcache_chunk_size (int): the chunk size for LMCache.
@@ -197,12 +199,17 @@ class ReqMeta:
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
+        # 3. if save_decode_cache is False and we are in decode phase (num_saved_tokens > 0)
+        
+        # Skip save if we're in decode phase and save_decode_cache is False
+        save_decode_cache = lmcache_connector.config.save_decode_cache
+        
         skip_leading_tokens = tracker.num_saved_tokens
         chunk_boundary = (
             cdiv(tracker.num_saved_tokens + 1, lmcache_chunk_size) * lmcache_chunk_size
         )
         skip_save = skip_save or (
-            tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary
+            tracker.num_saved_tokens > 0 and not save_decode_cache
         )
 
         if skip_save and load_spec is None:
@@ -304,7 +311,7 @@ class LMCacheConnectorV1Impl:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         is_tp = vllm_config.parallel_config.tensor_parallel_size > 1
 
-        config = lmcache_get_config()
+        self.config = lmcache_get_config()
         self.layerwise_retrievers = []
         if role == KVConnectorRole.SCHEDULER:
             # Create lookup client using factory
@@ -318,11 +325,11 @@ class LMCacheConnectorV1Impl:
                 vllm_config.parallel_config,
                 vllm_config.cache_config,
                 vllm_config.scheduler_config,
-                vllm_config,
+                vllm_config=vllm_config,
             )
 
-            self.use_layerwise = config.use_layerwise
-            self.enable_blending = config.enable_blending
+            self.use_layerwise = self.config.use_layerwise
+            self.enable_blending = self.config.enable_blending
 
             if self.enable_blending:
                 self.blender = LMCBlenderBuilder.get_or_create(
@@ -356,7 +363,7 @@ class LMCacheConnectorV1Impl:
             )
         )
 
-        self._lmcache_chunk_size = config.chunk_size
+        self._lmcache_chunk_size = self.config.chunk_size
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
@@ -843,6 +850,7 @@ class LMCacheConnectorV1Impl:
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(
+                self,
                 request_tracker,
                 self._block_size,
                 self._lmcache_chunk_size,
@@ -893,6 +901,7 @@ class LMCacheConnectorV1Impl:
             request_tracker.update(new_token_ids, new_block_ids)
 
             req_meta = ReqMeta.from_request_tracker(
+                self,
                 request_tracker,
                 self._block_size,
                 self._lmcache_chunk_size,
