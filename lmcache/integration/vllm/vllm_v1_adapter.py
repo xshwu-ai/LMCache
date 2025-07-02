@@ -550,7 +550,6 @@ class LMCacheConnectorV1Impl:
 
         self.layerwise_retrievers = []
         for idx, request in enumerate(metadata.requests):
-            logger.info(f"start_load_kv: {request.req_id=}, {request.caching=}")
             if not request.caching:
                 continue
             if request.load_spec is None:
@@ -681,7 +680,6 @@ class LMCacheConnectorV1Impl:
             self.layerwise_storers = []
 
             for idx, request in enumerate(connector_metadata.requests):
-                logger.info(f"save_kv_layer: {request.req_id=}, {request.caching=}")
                 if not request.caching:
                     continue
                 save_spec = request.save_spec
@@ -764,7 +762,6 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         for request in connector_metadata.requests:
-            logger.info(f"wait_for_save: {request.req_id=}, {request.caching=}")
             if not request.caching:
                 continue
             save_spec = request.save_spec
