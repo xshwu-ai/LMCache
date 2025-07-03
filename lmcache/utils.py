@@ -129,7 +129,7 @@ class CacheEngineKey:
     @staticmethod
     def from_string(s):
         parts = s.split("@")
-        if len(parts) != 5:
+        if len(parts) != 6:
             raise ValueError(f"Invalid key string: {s}")
         return CacheEngineKey(
             parts[0], parts[1], int(parts[2]), int(parts[3]), parts[4], parts[5]
@@ -204,7 +204,7 @@ class LayerCacheEngineKey(CacheEngineKey):
     @staticmethod
     def from_string(s):
         parts = s.split("@")
-        if len(parts) != 6:
+        if len(parts) != 7:
             raise ValueError(f"Invalid key string: {s}")
         return LayerCacheEngineKey(
             parts[0],
