@@ -157,7 +157,7 @@ class RequestTracker:
             new_block_ids = new_block_ids[0]
         self.allocated_block_ids.extend(new_block_ids)
 
-        if len(cached_request.new_token_ids) == 1:
+        if len(new_token_ids) == 1:
             self.is_decode_phase = True
 
 @dataclass
