@@ -22,6 +22,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 import torch
 import vllm.envs as envs
 import zmq
+import pickle
 
 # First Party
 from lmcache.logging import init_logger
@@ -67,9 +68,8 @@ class LMCacheLookupClient(LookupClientInterface):
             bind=False,
         )
 
-    def lookup(self, token_ids: torch.Tensor) -> int:
-        request = self.encoder.encode(token_ids)
-        self.socket.send_multipart(request, copy=False)
+    def lookup(self, token_ids: torch.Tensor, user: Optional[str] = "") -> int:
+        self.socket.send_multipart([pickle.dumps(user), pickle.dumps(token_ids)], copy=False)
         resp = self.socket.recv()
         result = int.from_bytes(resp, "big")
         return result
@@ -106,8 +106,9 @@ class LMCacheLookupServer:
                 # try:
                 # request = self.socket.recv()
                 frames = self.socket.recv_multipart(copy=False)
-                token_ids = self.decoder.decode(frames)
-                result = self.lmcache_engine.lookup(token_ids, pin=True)
+                user = pickle.loads(frames[0])
+                token_ids = pickle.loads(frames[1])
+                result = self.lmcache_engine.lookup(token_ids, pin=True, user=user)
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
                 # except Exception as e:
