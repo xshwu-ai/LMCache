@@ -1550,3 +1550,45 @@ class CuFileMemoryAllocator(GPUMemoryAllocator):
 
     def __del__(self):
         self.cuFileBufDeregister(ctypes.c_void_p(self.base_pointer))
+
+class FakeMemoryAllocator(MemoryAllocatorInterface):
+    """
+    Allocates (1) memory in the pre-allocated pinned memory.
+              (2) byte_array buffer memory.
+    """
+
+    def __init__(self, size: int, use_paging: bool = False, **kwargs):
+        """
+        :param int size: The size of the pinned memory in bytes.
+        """
+        pass
+
+    @_lmcache_nvtx_annotate
+    def allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+    ) -> Optional[MemoryObj]:
+        raise ValueError(f"Unsupported memory format: {fmt}")
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+    ) -> Optional[List[MemoryObj]]:
+        raise ValueError(f"Unsupported memory format: {fmt}")
+
+    @_lmcache_nvtx_annotate
+    def free(self, memory_obj: MemoryObj):
+        pass
+
+    @_lmcache_nvtx_annotate
+    def batched_free(self, memory_objs: List[MemoryObj], update_stats: bool = True):
+        pass
+
+    def memcheck(self):
+        return True

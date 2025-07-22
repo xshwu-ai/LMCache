@@ -44,6 +44,7 @@ from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
     MemoryFormat,
     MixedMemoryAllocator,
+    FakeMemoryAllocator,
 )
 from lmcache.v1.memory_management import (
     MemoryObjMetadata,
@@ -314,7 +315,7 @@ class LMCacheEngine:
                             )
                             memory_obj = future_memory_obj.result()
                         if memory_obj is None:
-                            logger.warn(f"{self.tpg.rank=} retrive memory_obj is None")
+                            logger.warning(f"{self.tpg.rank=} retrive memory_obj is None")
                             self.tpg.broadcast_object(None, self.tpg.first_rank)
                             break
                     # broadcast
@@ -323,7 +324,7 @@ class LMCacheEngine:
                 else:
                     metadata_dict = self.tpg.broadcast_object(None, self.tpg.first_rank)
                     if metadata_dict is None:
-                        logger.warn(f"retrive broadcast tensor {self.tpg.rank=}, cost: {round((time.time()-t)*1000)}")
+                        logger.warning(f"retrive broadcast tensor {self.tpg.rank=}, cost: {round((time.time()-t)*1000)}")
                         break
                     metadata = MemoryObjMetadata.from_dict(metadata_dict)
                     tensor = torch.empty(metadata.shape, dtype=metadata.dtype, device=f"cuda:{self.tpg.rank}")
@@ -345,9 +346,17 @@ class LMCacheEngine:
             # When the object is retrieved back to vLLM, the storage backend
             # will immediately remove the object from itself
             if self.remove_after_retrieve:
-                self.storage_manager.remove(key)
+                if self.tpg:
+                    if self.tpg.is_first_rank:
+                        self.storage_manager.remove(key)
+                else:
+                    self.storage_manager.remove(key)
             else:
-                self.storage_manager.batched_unpin([key])
+                if self.tpg:
+                    if self.tpg.is_first_rank:
+                        self.storage_manager.batched_unpin([key])
+                else:
+                    self.storage_manager.batched_unpin([key])
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -367,6 +376,9 @@ class LMCacheEngine:
         """Launch the prefetching process in the storage manager to load the
         KV to the local CPU memory
         """
+        if self.tpg:
+            if not self.tpg.is_first_rank:
+                return
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             assert isinstance(key, CacheEngineKey)
             self.storage_manager.prefetch(key)
@@ -424,6 +436,22 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     def clear(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+        locations: Optional[List[str]] = None,
+    ) -> int:
+        if self.tpg:
+            if self.tpg.is_first_rank:
+                num_removed = self._clear(tokens, locations)
+                self.tpg.broadcast_object(num_removed, self.tpg.first_rank)
+                return num_removed
+            else:
+                num_removed = self.tpg.broadcast_object(None, self.tpg.first_rank)
+                return int(num_removed)
+        return self._clear(tokens, locations)
+        
+    
+    def _clear(
         self,
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,
         locations: Optional[List[str]] = None,
@@ -966,8 +994,10 @@ class LMCacheEngineBuilder:
         if config.weka_path is not None or config.gds_path is not None:
             assert config.cufile_buffer_size is not None
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
-
+        
         max_local_cpu_size = config.max_local_cpu_size
+        if config.save_only_first_rank and metadata.worker_id != 0:
+            return FakeMemoryAllocator(int(max_local_cpu_size * 1024**3))
         return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3))
 
     @staticmethod
