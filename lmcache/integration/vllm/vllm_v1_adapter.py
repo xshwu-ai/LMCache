@@ -1,7 +1,20 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2025 LMCache Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Standard
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union, OrderedDict
 import os
 
 # Third Party
@@ -100,6 +113,11 @@ class RequestTracker:
     # Multimodal hashes and positions
     mm_hashes: Optional[list[str]] = None
     mm_positions: Optional[list["PlaceholderRange"]] = None
+    # The request tags
+    tags: OrderedDict = None
+
+    # Whether the request is in decode phase
+    is_decode_phase: bool = False
 
     @staticmethod
     def from_new_request(
@@ -138,6 +156,12 @@ class RequestTracker:
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
 
+        tags = None
+        if new_request.sampling_params.extra_args is not None:
+            if kv_transfer_params := new_request.sampling_params.extra_args.get("kv_transfer_params"):
+                tags = OrderedDict()
+                tags["user"] = kv_transfer_params.get("user", "")
+        
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
@@ -147,6 +171,7 @@ class RequestTracker:
             disagg_spec=disagg_spec,
             mm_hashes=new_request.mm_hashes.copy(),
             mm_positions=new_request.mm_positions.copy(),
+            tags=tags,
         )
 
     def update(
@@ -170,6 +195,9 @@ class RequestTracker:
             raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
         self.allocated_block_ids.extend(new_block_ids)
 
+        if len(new_token_ids) == 1:
+            self.is_decode_phase = True
+
 
 @dataclass
 class ReqMeta:
@@ -189,9 +217,12 @@ class ReqMeta:
     load_spec: Optional[LoadSpec] = None
     # disagg spec
     disagg_spec: Optional[DisaggSpec] = None
+    # tags
+    tags: OrderedDict = None
 
     @staticmethod
     def from_request_tracker(
+        lmcache_connector: "LMCacheConnectorV1Impl",
         tracker: RequestTracker,
         block_size: int,
         lmcache_chunk_size: int = 256,
@@ -202,6 +233,7 @@ class ReqMeta:
         """Create the request metadata from a request tracker.
 
         Args:
+            lmcache_connector (LMCacheConnectorV1Impl): the LMCache connector instance.
             tracker (RequestTracker): the request tracker.
             block_size (int): the block size in vLLM.
             lmcache_chunk_size (int): the chunk size for LMCache.
@@ -223,12 +255,20 @@ class ReqMeta:
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
+        # 3. if save_decode_cache is False and we are in decode phase
+        # (num_saved_tokens > 0)
+
+        # Skip save if we're in decode phase and save_decode_cache is False
+        save_decode_cache = lmcache_connector.config.save_decode_cache
+
         skip_leading_tokens = tracker.num_saved_tokens
         chunk_boundary = (
             cdiv(tracker.num_saved_tokens + 1, lmcache_chunk_size) * lmcache_chunk_size
         )
-        skip_save = skip_save or (
-            tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary
+        skip_save = (
+            skip_save
+            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
+            or (not save_decode_cache and tracker.is_decode_phase)
         )
 
         if skip_save and load_spec is None:
@@ -302,6 +342,7 @@ class ReqMeta:
             save_spec=save_spec,
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
+            tags=tracker.tags,
         )
 
 
@@ -329,11 +370,13 @@ class LMCacheConnectorV1Impl:
         self._parent = parent
         self.kv_role = vllm_config.kv_transfer_config.kv_role
 
-        config = lmcache_get_config()
+        self.config = lmcache_get_config()
         self.layerwise_retrievers = []
         if role == KVConnectorRole.SCHEDULER:
             # Create lookup client using factory
-            self.lookup_client = LookupClientFactory.create_lookup_client(vllm_config)
+            self.lookup_client = LookupClientFactory.create_lookup_client(
+                vllm_config, self.config
+            )
             self._unfinished_requests: dict[str, Request] = {}
             self._lookup_requests_in_step: list[str] = []
         else:
@@ -342,10 +385,11 @@ class LMCacheConnectorV1Impl:
                 vllm_config.parallel_config,
                 vllm_config.cache_config,
                 vllm_config.scheduler_config,
+                vllm_config=vllm_config,
             )
 
-            self.use_layerwise = config.use_layerwise
-            self.enable_blending = config.enable_blending
+            self.use_layerwise = self.config.use_layerwise
+            self.enable_blending = self.config.enable_blending
 
             if self.enable_blending:
                 self.blender = LMCBlenderBuilder.get_or_create(
@@ -385,7 +429,7 @@ class LMCacheConnectorV1Impl:
             )
         )
 
-        self._lmcache_chunk_size = config.chunk_size
+        self._lmcache_chunk_size = self.config.chunk_size
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
@@ -395,6 +439,12 @@ class LMCacheConnectorV1Impl:
             vllm_config.parallel_config
         )
         self.current_layer = 0
+        logger.info(
+            f"Init LMCacheConnectorV1Impl(role={role}) with "
+            f"discard_partial_chunks: {self._discard_partial_chunks}, "
+            f"skip_last_n_tokens: {self.skip_last_n_tokens}, "
+            f"num_layers: {self.num_layers}"
+        )
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
 
@@ -499,6 +549,7 @@ class LMCacheConnectorV1Impl:
                     token_mask[:lmcache_cached_tokens],
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    tags=request.tags,
                 )
 
                 # Check the result
@@ -685,10 +736,6 @@ class LMCacheConnectorV1Impl:
             if self.kv_role == "kv_producer":
                 skip_leading_tokens = 0
             else:
-                skip_leading_tokens = max(
-                    self.lmcache_engine.lookup(token_ids),
-                    save_spec.skip_leading_tokens,
-                )
                 skip_leading_tokens = save_spec.skip_leading_tokens
 
                 if skip_leading_tokens == len(token_ids):
@@ -732,6 +779,7 @@ class LMCacheConnectorV1Impl:
                 slot_mapping=slot_mapping,
                 offset=skip_leading_tokens,
                 transfer_spec=request.disagg_spec,
+                tags=request.tags,
             )
 
             # NOTE(Jiayi): We assume all tokens are saved
@@ -776,15 +824,21 @@ class LMCacheConnectorV1Impl:
             apply_mm_hashes_to_token_ids(
                 token_ids, request.mm_hashes, request.mm_positions
             )
+        
+        tags = None
+        if request.sampling_params.extra_args is not None:
+            if kv_transfer_params := request.sampling_params.extra_args.get("kv_transfer_params"):
+                tags = OrderedDict()
+                tags["user"] = kv_transfer_params.get("user", "")
 
         self._lookup_requests_in_step.append(request.request_id)
         if self.skip_last_n_tokens > 0:
             num_external_hit_tokens = self.lookup_client.lookup(
-                token_ids[: -self.skip_last_n_tokens], request_id=request.request_id
+                token_ids[: -self.skip_last_n_tokens], request_id=request.request_id, tags=tags
             )
         else:
             num_external_hit_tokens = self.lookup_client.lookup(
-                token_ids, request_id=request.request_id
+                token_ids, request_id=request.request_id, tags=tags
             )
 
         # When prompt length is divisible by the block size and all
@@ -924,6 +978,7 @@ class LMCacheConnectorV1Impl:
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(
+                self,
                 request_tracker,
                 self._block_size,
                 self._lmcache_chunk_size,
@@ -945,6 +1000,7 @@ class LMCacheConnectorV1Impl:
                 request_tracker.update(req.new_token_ids, req.new_block_ids)
 
                 req_meta = ReqMeta.from_request_tracker(
+                    self,
                     request_tracker,
                     self._block_size,
                     self._lmcache_chunk_size,
@@ -974,6 +1030,7 @@ class LMCacheConnectorV1Impl:
             request_tracker.update(new_token_ids, new_block_ids)
 
             req_meta = ReqMeta.from_request_tracker(
+                self,
                 request_tracker,
                 self._block_size,
                 self._lmcache_chunk_size,

@@ -1,7 +1,20 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2025 LMCache Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Standard
 from collections import defaultdict
-from typing import Dict, Generator, List, Optional, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Union, OrderedDict
 import asyncio
 import multiprocessing
 import time
@@ -31,8 +44,10 @@ from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
     MemoryFormat,
+    MemoryObjMetadata,
     MixedMemoryAllocator,
     NixlCPUMemoryAllocator,
+    TensorMemoryObj,
 )
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.token_database import (
@@ -72,6 +87,8 @@ class LMCacheEngine:
         memory_allocator: MemoryAllocatorInterface,
         token_database: TokenDatabase,
         gpu_connector: GPUConnectorInterface,
+        broadcast_fn: Callable[[torch.Tensor, int], None],
+        broadcast_object_fn: Callable[[Any, int], Any],
     ):
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
@@ -79,6 +96,16 @@ class LMCacheEngine:
         self.memory_allocator = memory_allocator
         self.token_database = token_database
         self.gpu_connector = gpu_connector
+        self.broadcast_fn = broadcast_fn
+        self.broadcast_object_fn = broadcast_object_fn
+        save_only_first_rank_default = True if metadata.use_mla else False
+        self.save_only_first_rank = (
+            self.config.extra_config.get(
+                "save_only_first_rank", save_only_first_rank_default
+            )
+            if self.config.extra_config
+            else save_only_first_rank_default
+        )
 
         self.enable_p2p = config.enable_p2p
 
@@ -106,8 +133,6 @@ class LMCacheEngine:
         )
 
         # HACK: remove this in the future
-        # NOTE (Jiayi): This is currently used to support
-        # dropping the kv cache in nixl backend at decoder.
         self.remove_after_retrieve = (
             config.enable_nixl and config.nixl_role == "receiver"
         )
@@ -177,6 +202,9 @@ class LMCacheEngine:
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        if self.save_only_first_rank and not self.metadata.is_first_rank():
+            logger.debug(f"rank={self.metadata.worker_id} ignore store")
+            return
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
@@ -204,9 +232,12 @@ class LMCacheEngine:
         tot_kv_size = 0
         tot_token_num = 0
         t = time.perf_counter()
+        tags = kwargs.get("tags")
+        if tags is not None:
+            assert isinstance(tags, OrderedDict)
 
         for start, end, key in self.token_database.process_tokens(
-            tokens, hashes, offsets, mask
+            tokens, hashes, offsets, mask, tags=tags,
         ):
             assert isinstance(key, CacheEngineKey)
             # Allocate the memory object
@@ -302,8 +333,12 @@ class LMCacheEngine:
         memory_objs = []
         tot_token_num = 0
         kv_dtype = self.metadata.kv_dtype
+        tags = kwargs.get("tags")
+        if tags is not None:
+            assert isinstance(tags, OrderedDict)
+
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask
+            tokens=tokens, mask=mask, tags=tags
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -416,69 +451,146 @@ class LMCacheEngine:
         reordered_memory_objs = []
         reordered_starts = []
         reordered_ends = []
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask
-        ):
-            assert isinstance(key, CacheEngineKey)
+        tags = kwargs.get("tags")
+        if tags is not None:
+            assert isinstance(tags, OrderedDict)
+        if not self.save_only_first_rank or self.metadata.is_first_rank():
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens, mask=mask, tags=tags,
+            ):
+                assert isinstance(key, CacheEngineKey)
 
-            if key in self.lookup_cache:
-                # TODO(Jiayi): we can reduce the number of `contains` calls
-                # by checking the lookup cache first (should be updated in `lookup`)
-                pass
-            else:
-                # NOTE: key should always be in the lookup cache once
-                # we support it.
-                location = self.storage_manager.contains(key)
-                if location is None:
-                    # TODO(Jiayi): Need to refactor P2P as a storage backend to
-                    # clean up the following code.
-                    if self.enable_p2p:
-                        future_memory_obj = asyncio.run_coroutine_threadsafe(
-                            self.distributed_server.issue_get(key),
-                            self.distributed_loop,
-                        )
-                        memory_obj = future_memory_obj.result()
-                        if memory_obj:
-                            reordered_keys.append(key)
-                            reordered_memory_objs.append(memory_obj)
-                            reordered_starts.append(start)
-                            reordered_ends.append(end)
-                            ret_mask[start:end] = True
-                        else:
-                            # NOTE: break for P2P retrieve KV because of no required
-                            # memory obj
-                            break
+                if key in self.lookup_cache:
+                    # TODO(Jiayi): we can reduce the number of `contains` calls
+                    # by checking the lookup cache first (should be updated in `lookup`)
+                    pass
+                else:
+                    # NOTE: key should always be in the lookup cache once
+                    # we support it.
+                    location = self.storage_manager.contains(key)
+                    if location is None:
+                        # TODO(Jiayi): Need to refactor P2P as a storage backend to
+                        # clean up the following code.
+                        if self.enable_p2p:
+                            future_memory_obj = asyncio.run_coroutine_threadsafe(
+                                self.distributed_server.issue_get(key),
+                                self.distributed_loop,
+                            )
+                            memory_obj = future_memory_obj.result()
+                            if memory_obj:
+                                reordered_keys.append(key)
+                                reordered_memory_objs.append(memory_obj)
+                                reordered_starts.append(start)
+                                reordered_ends.append(end)
+                                ret_mask[start:end] = True
+                            else:
+                                # NOTE: break for P2P retrieve KV because of no required
+                                # memory obj
+                                break
+                            continue
+                        break
+
+                    # NOTE: Here we make the assumption that the underlying
+                    # storage backend support pin operation, and the memory
+                    # object is already pinned in the storage backend.
+                    ret_mask[start:end] = True
+
+                    if location not in key_mapping:
+                        key_mapping[location] = [key]
+                        start_mapping[location] = [start]
+                        end_mapping[location] = [end]
                         continue
-                    break
 
-                # NOTE: Here we make the assumption that the underlying
-                # storage backend support pin operation, and the memory
-                # object is already pinned in the storage backend.
-                ret_mask[start:end] = True
+                assert location is not None
 
-                if location not in key_mapping:
-                    key_mapping[location] = [key]
-                    start_mapping[location] = [start]
-                    end_mapping[location] = [end]
-                    continue
+                key_mapping[location].append(key)
+                start_mapping[location].append(start)
+                end_mapping[location].append(end)
 
-            assert location is not None
+            # TODO(Jiayi): We can parallelize the retrieval from
+            # different storage backends.
+            for location, keys in key_mapping.items():
+                memory_objs = self.storage_manager.batched_get(
+                    keys=keys,
+                    storage_backend_name=location,
+                )
+                reordered_memory_objs.extend(memory_objs)
+                reordered_keys.extend(keys)
+                reordered_starts.extend(start_mapping[location])
+                reordered_ends.extend(end_mapping[location])
 
-            key_mapping[location].append(key)
-            start_mapping[location].append(start)
-            end_mapping[location].append(end)
+        if self.save_only_first_rank:
+            if self.metadata.is_first_rank():
+                # Check if the lengths of the lists are the same
+                if (
+                    len(reordered_keys) != len(reordered_starts)
+                    or len(reordered_keys) != len(reordered_ends)
+                    or len(reordered_keys) != len(reordered_memory_objs)
+                ):
+                    logger.warning(
+                        f"reordered_keys,reordered_starts,reordered_ends,"
+                        f"reordered_memory_objs have different lengths with"
+                        f" {len(reordered_keys)}, {len(reordered_starts)}, "
+                        f"{len(reordered_ends)}, {len(reordered_memory_objs)}"
+                    )
 
-        # TODO(Jiayi): We can parallelize the retrieval from
-        # different storage backends.
-        for location, keys in key_mapping.items():
-            memory_objs = self.storage_manager.batched_get(
-                keys=keys,
-                storage_backend_name=location,
-            )
-            reordered_memory_objs.extend(memory_objs)
-            reordered_keys.extend(keys)
-            reordered_starts.extend(start_mapping[location])
-            reordered_ends.extend(end_mapping[location])
+                # broadcast starts and ends
+                self.broadcast_object_fn(
+                    {"starts": reordered_starts, "ends": reordered_ends},
+                    self.metadata.first_rank,
+                )
+
+                # broadcast memory_objs
+                for i in range(len(reordered_starts)):
+                    memory_obj = reordered_memory_objs[i]
+
+                    # broadcast metadata
+                    metadata_dict = memory_obj.metadata.to_dict()
+                    self.broadcast_object_fn(metadata_dict, self.metadata.first_rank)
+
+                    # broadcast tensor
+                    tensor_to_broadcast = memory_obj.tensor.to(
+                        f"cuda:{self.metadata.worker_id}"
+                    )
+                    self.broadcast_fn(tensor_to_broadcast, self.metadata.first_rank)
+            else:
+                # receive key lists
+                data = self.broadcast_object_fn(None, self.metadata.first_rank)
+                if data is None:
+                    logger.warning(f"rank={self.metadata.worker_id} received None data")
+                else:
+                    reordered_starts = data["starts"]
+                    reordered_ends = data["ends"]
+
+                    # receive tensors
+                    for start, end in zip(
+                        reordered_starts, reordered_ends, strict=False
+                    ):
+                        ret_mask[start:end] = True  # set the mask
+
+                        # receive metadata
+                        metadata_dict = self.broadcast_object_fn(
+                            None, self.metadata.first_rank
+                        )
+                        if metadata_dict is None:
+                            logger.warning(
+                                f"rank={self.metadata.worker_id} received None "
+                                f"metadata for segment ({start}, {end})"
+                            )
+                            break
+
+                        # receive tensor
+                        metadata = MemoryObjMetadata.from_dict(metadata_dict)
+                        tensor = torch.empty(
+                            metadata.shape,
+                            dtype=metadata.dtype,
+                            device=f"cuda:{self.metadata.worker_id}",
+                        )
+                        self.broadcast_fn(tensor, self.metadata.first_rank)
+
+                        # create temp memory obj
+                        memory_obj = TensorMemoryObj(raw_data=tensor, metadata=metadata)
+                        reordered_memory_objs.append(memory_obj)
 
         # NOTE(Jiayi): memory_obj doesn't have to be a pinned
         # cpu tensor for the sake of performance.
@@ -490,7 +602,9 @@ class LMCacheEngine:
 
         # TODO(Jiayi): Remove the following for loop with batched operations
         for key, memory_obj in zip(reordered_keys, reordered_memory_objs, strict=False):
-            if self.remove_after_retrieve:
+            if self.remove_after_retrieve and (
+                not self.save_only_first_rank or self.metadata.is_first_rank()
+            ):
                 self.storage_manager.remove(key)
             memory_obj.ref_count_down()
 
@@ -545,8 +659,12 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+
+        tags = kwargs.get("tags")
+        if tags is not None:
+            assert isinstance(tags, OrderedDict)
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask
+            tokens=tokens, mask=mask, tags=tags,
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -616,14 +734,18 @@ class LMCacheEngine:
     @_lmcache_nvtx_annotate
     def prefetch(
         self,
-        tokens: Union[torch.Tensor, List[int]],
+        tokens: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        tags: OrderedDict = None,
     ) -> None:
         """Launch the prefetching process in the storage manager to load the
         KV to the local CPU memory
         """
+        if self.save_only_first_rank:
+            if not self.metadata.is_first_rank():
+                return
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask
+            tokens=tokens, mask=mask, tags=tags
         ):
             assert isinstance(key, CacheEngineKey)
             self.storage_manager.prefetch(key)
@@ -636,6 +758,7 @@ class LMCacheEngine:
         search_range: Optional[List[str]] = None,
         request_id: Optional[str] = None,
         pin: bool = False,
+        tags: OrderedDict = None,
     ) -> int:
         """
         Checks the existence of KV cache of the tokens from the cache engine.
@@ -662,7 +785,7 @@ class LMCacheEngine:
         # secondary lookup on p2p (via lookup_server) if enabled
         search_p2p = self.enable_p2p and (search_range is None or "p2p" in search_range)
 
-        for start, end, key in self.token_database.process_tokens(tokens=tokens):
+        for start, end, key in self.token_database.process_tokens(tokens=tokens, tags=tags):
             assert isinstance(key, CacheEngineKey)
 
             if self.use_layerwise:
@@ -715,6 +838,23 @@ class LMCacheEngine:
         self,
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,
         locations: Optional[List[str]] = None,
+        tags: OrderedDict = None, # TODO: need to clean by tags
+    ) -> int:
+        if self.save_only_first_rank:
+            if self.metadata.is_first_rank():
+                num_removed = self._clear(tokens, locations, tags=tags)
+                self.broadcast_object_fn(num_removed, self.metadata.first_rank)
+                return num_removed
+            else:
+                num_removed = self.broadcast_object_fn(None, self.metadata.first_rank)
+                return int(num_removed)
+        return self._clear(tokens, locations)
+
+    def _clear(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+        locations: Optional[List[str]] = None,
+        tags: OrderedDict = None,
     ) -> int:
         assert isinstance(self.storage_manager, StorageManager)
         # Clear all caches if tokens is None
@@ -724,7 +864,7 @@ class LMCacheEngine:
 
         num_removed = 0
         # Only remove the caches for the given tokens
-        for start, end, key in self.token_database.process_tokens(tokens=tokens):
+        for start, end, key in self.token_database.process_tokens(tokens=tokens, tags=tags):
             assert isinstance(key, CacheEngineKey)
             removed = self.storage_manager.remove(key, locations)
             num_removed += removed
@@ -740,9 +880,6 @@ class LMCacheEngine:
             self.lmcache_worker.close()
 
         self.storage_manager.close()
-
-        self.memory_allocator.close()
-
         logger.info("LMCacheEngine closed.")
 
 
@@ -797,6 +934,25 @@ class LMCacheEngineBuilder:
             return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
         max_local_cpu_size = config.max_local_cpu_size
+        save_only_first_rank_default = True if metadata.use_mla else False
+        save_only_first_rank = (
+            config.extra_config.get(
+                "save_only_first_rank", save_only_first_rank_default
+            )
+            if config.extra_config
+            else save_only_first_rank_default
+        )
+        if save_only_first_rank and metadata.is_first_rank():
+            # Only the first rank will save the cache,
+            # so we need to set it lager than other ranks
+            first_rank_max_local_cpu_size = (
+                config.extra_config.get(
+                    "first_rank_max_local_cpu_size", max_local_cpu_size
+                )
+                if config.extra_config
+                else max_local_cpu_size
+            )
+            return MixedMemoryAllocator(int(first_rank_max_local_cpu_size * 1024**3))
         return MixedMemoryAllocator(int(max_local_cpu_size * 1024**3))
 
     @staticmethod
@@ -815,6 +971,8 @@ class LMCacheEngineBuilder:
         config: LMCacheEngineConfig,
         metadata: LMCacheEngineMetadata,
         gpu_connector: GPUConnectorInterface,
+        broadcast_fn: Callable[[torch.Tensor, int], None] = None,
+        broadcast_object_fn: Callable[[Any, int], Any] = None,
     ) -> LMCacheEngine:
         """
         Builds a new LMCacheEngine instance if it doesn't already exist for the
@@ -835,6 +993,8 @@ class LMCacheEngineBuilder:
                 memory_allocator,
                 token_database,
                 gpu_connector,
+                broadcast_fn,
+                broadcast_object_fn,
             )
 
             cls._instances[instance_id] = engine

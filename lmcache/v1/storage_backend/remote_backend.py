@@ -1,4 +1,17 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2025 LMCache Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Standard
 from concurrent.futures import Future, TimeoutError
 from typing import List, Optional
@@ -127,7 +140,7 @@ class RemoteBackend(StorageBackendInterface):
         # For MLA worker id as 0 mode, use worker_id 0
         if self._mla_worker_id_as0_mode:
             key = CacheEngineKey(
-                key.fmt, key.model_name, key.world_size, 0, key.chunk_hash
+                key.fmt, key.model_name, key.world_size, 0, key.chunk_hash, key.tags
             )
 
         future = asyncio.run_coroutine_threadsafe(
@@ -163,7 +176,7 @@ class RemoteBackend(StorageBackendInterface):
             return None
 
         # If MLA worker id as 0 mode is enabled, skip put tasks
-        if self._mla_worker_id_as0_mode:
+        if self._mla_worker_id_as0_mode or self.exists_in_put_tasks(key):
             return None
 
         memory_obj.ref_count_up()
@@ -198,7 +211,7 @@ class RemoteBackend(StorageBackendInterface):
     def submit_prefetch_task(
         self,
         key: CacheEngineKey,
-    ) -> bool:
+    ) -> Optional[Future]:
         raise NotImplementedError
 
     @_lmcache_nvtx_annotate
@@ -216,7 +229,7 @@ class RemoteBackend(StorageBackendInterface):
         # For MLA worker id as 0 mode, use worker_id 0
         if self._mla_worker_id_as0_mode:
             key = CacheEngineKey(
-                key.fmt, key.model_name, key.world_size, 0, key.chunk_hash
+                key.fmt, key.model_name, key.world_size, 0, key.chunk_hash, key.tags
             )
         t1 = time.perf_counter()
         future = asyncio.run_coroutine_threadsafe(self.connection.get(key), self.loop)
